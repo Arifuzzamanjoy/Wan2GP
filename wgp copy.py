@@ -54,8 +54,6 @@ import requests
 # dynamo.config.recompile_limit = 2000   # default is 256
 # dynamo.config.accumulated_recompile_limit = 2000  # or whatever limit you want
 
-global_queue_ref = []
-AUTOSAVE_FILENAME = "queue.zip"
 PROMPT_VARS_MAX = 10
 
 target_mmgp_version = "3.5.10"
@@ -70,8 +68,6 @@ if mmgp_version != target_mmgp_version:
     print(f"Incorrect version of mmgp ({mmgp_version}), version {target_mmgp_version} is needed. Please upgrade with the command 'pip install -r requirements.txt'")
     exit()
 lock = threading.Lock()
-current_task_id = None
-task_id = 0
 vmc_event_handler = matanyone_app.get_vmc_event_handler()
 unique_id = 0
 unique_id_lock = threading.Lock()
@@ -205,28 +201,84 @@ def get_unique_id():
     return str(time.time()+unique_id)
 
 def download_ffmpeg():
-    if os.name != 'nt': return
+    # Only download on Windows
+    if os.name != 'nt': 
+        return
+        
+    # Check if ffmpeg executables already exist
     exes = ['ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe']
-    if all(os.path.exists(e) for e in exes): return
-    api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
-    r = requests.get(api_url, headers={'Accept': 'application/vnd.github+json'})
-    assets = r.json().get('assets', [])
-    zip_asset = next((a for a in assets if 'essentials_build.zip' in a['name']), None)
-    if not zip_asset: return
-    zip_url = zip_asset['browser_download_url']
-    zip_name = zip_asset['name']
-    with requests.get(zip_url, stream=True) as resp:
-        total = int(resp.headers.get('Content-Length', 0))
-        with open(zip_name, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True) as pbar:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                pbar.update(len(chunk))
-    with zipfile.ZipFile(zip_name) as z:
-        for f in z.namelist():
-            if f.endswith(tuple(exes)) and '/bin/' in f:
-                z.extract(f)
-                os.rename(f, os.path.basename(f))
-    os.remove(zip_name)
+    if all(os.path.exists(e) for e in exes): 
+        return
+        
+    try:
+        # Get latest release info from GitHub API
+        api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
+        response = requests.get(api_url, headers={'Accept': 'application/vnd.github+json'}, timeout=30)
+        response.raise_for_status()
+        
+        assets = response.json().get('assets', [])
+        
+        # Find the essentials build
+        zip_asset = next((a for a in assets if 'essentials_build.zip' in a['name']), None)
+        if not zip_asset: 
+            print("Could not find FFmpeg essentials build in latest release")
+            return
+            
+        zip_url = zip_asset['browser_download_url']
+        zip_name = zip_asset['name']
+        
+        print(f"Downloading FFmpeg from {zip_url}")
+        
+        # Download with progress bar
+        with requests.get(zip_url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get('Content-Length', 0))
+            
+            with open(zip_name, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True, desc="Downloading FFmpeg") as pbar:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+        
+        print("Extracting FFmpeg executables...")
+        
+        # Extract only the needed executables
+        with zipfile.ZipFile(zip_name, 'r') as z:
+            for file_info in z.namelist():
+                if any(file_info.endswith(exe) for exe in exes) and '/bin/' in file_info:
+                    # Extract to current directory
+                    extracted_path = z.extract(file_info)
+                    exe_name = os.path.basename(file_info)
+                    
+                    # Move to current directory if not already there
+                    if extracted_path != exe_name:
+                        if os.path.exists(exe_name):
+                            os.remove(exe_name)
+                        os.rename(extracted_path, exe_name)
+                    
+                    print(f"Extracted {exe_name}")
+        
+        # Clean up downloaded zip and any extracted directories
+        if os.path.exists(zip_name):
+            os.remove(zip_name)
+            
+        # Remove any extracted directory structure
+        for item in os.listdir('.'):
+            if os.path.isdir(item) and 'ffmpeg' in item.lower():
+                shutil.rmtree(item, ignore_errors=True)
+                
+        print("FFmpeg installation completed successfully")
+        
+    except requests.RequestException as e:
+        print(f"Error downloading FFmpeg: {e}")
+    except zipfile.BadZipFile as e:
+        print(f"Error extracting FFmpeg: {e}")
+        if os.path.exists(zip_name):
+            os.remove(zip_name)
+    except Exception as e:
+        print(f"Unexpected error during FFmpeg installation: {e}")
+        if 'zip_name' in locals() and os.path.exists(zip_name):
+            os.remove(zip_name)
 
 
 def format_time(seconds):
@@ -282,464 +334,6 @@ def compute_sliding_window_no(current_video_length, sliding_window_size, discard
     return 1 + math.ceil(left_after_first_window / (sliding_window_size - discard_last_frames - reuse_frames))
 
 
-def process_prompt_and_add_tasks(state, model_choice):
- 
-    if state.get("validate_success",0) != 1:
-        return
-    
-    state["validate_success"] = 0
-    model_filename = state["model_filename"]
-    model_type = state["model_type"]
-    inputs = get_model_settings(state, model_type)
-
-    if model_choice != model_type or inputs ==None:
-        raise gr.Error("Webform can not be used as the App has been restarted since the form was displayed. Please refresh the page")
-    
-    inputs["state"] =  state
-    gen = get_gen_info(state)
-    inputs["model_type"] = model_type
-    inputs.pop("lset_name")
-    if inputs == None:
-        gr.Warning("Internal state error: Could not retrieve inputs for the model.")
-        queue = gen.get("queue", [])
-        return get_queue_table(queue)
-    model_def = get_model_def(model_type)
-    model_handler = get_model_handler(model_type)
-    image_outputs = inputs["image_mode"] == 1
-    any_steps_skipping = model_def.get("tea_cache", False) or model_def.get("mag_cache", False)
-    model_type = get_base_model_type(model_type)
-    inputs["model_filename"] = model_filename
-    
-    mode = inputs["mode"]
-    if mode.startswith("edit_"):
-        edit_video_source =gen.get("edit_video_source", None)
-        edit_overrides =gen.get("edit_overrides", None)
-        _ , _ , _, frames_count = get_video_info(edit_video_source)
-        if frames_count > max_source_video_frames:
-            gr.Info(f"Post processing is not supported on videos longer than {max_source_video_frames} frames. Output Video will be truncated")
-            # return
-        for k in ["image_start", "image_end", "image_refs", "video_guide", "audio_guide", "audio_guide2", "audio_source" , "video_mask", "image_mask"]:
-            inputs[k] = None    
-        inputs.update(edit_overrides)
-        del gen["edit_video_source"], gen["edit_overrides"]
-        inputs["video_source"]= edit_video_source 
-        prompt = []
-
-        spatial_upsampling = inputs.get("spatial_upsampling","")
-        if len(spatial_upsampling) >0: prompt += ["Spatial Upsampling"]
-        temporal_upsampling = inputs.get("temporal_upsampling","")
-        if len(temporal_upsampling) >0: prompt += ["Temporal Upsampling"]
-        if has_image_file_extension(edit_video_source)  and len(temporal_upsampling) > 0:
-            gr.Info("Temporal Upsampling can not be used with an Image")
-            return 
-        film_grain_intensity  = inputs.get("film_grain_intensity",0)
-        film_grain_saturation  = inputs.get("film_grain_saturation",0.5)        
-        # if film_grain_intensity >0: prompt += [f"Film Grain: intensity={film_grain_intensity}, saturation={film_grain_saturation}"]
-        if film_grain_intensity >0: prompt += ["Film Grain"]
-        MMAudio_setting = inputs.get("MMAudio_setting",0)
-        repeat_generation= inputs.get("repeat_generation",1)
-        if mode =="edit_remux":
-            audio_source = inputs["audio_source"]
-            if  MMAudio_setting== 1:
-                prompt += ["MMAudio"]
-                audio_source = None 
-                inputs["audio_source"] = audio_source
-            else:
-                if audio_source is None:
-                    gr.Info("You must provide a custom Audio")
-                    return
-                prompt += ["Custom Audio"]
-                repeat_generation == 1
-
-        seed = inputs.get("seed",None)
-        if len(prompt) == 0:
-            if mode=="edit_remux":
-                gr.Info("You must choose at least one Remux Method")
-            else:
-                gr.Info("You must choose at least one Post Processing Method")
-            return
-        inputs["prompt"] = ", ".join(prompt)
-        add_video_task(**inputs)
-        gen["prompts_max"] = 1 + gen.get("prompts_max",0)
-        state["validate_success"] = 1
-        queue= gen.get("queue", [])
-        return update_queue_data(queue)
-
-    if hasattr(model_handler, "validate_generative_settings"):
-        error = model_handler.validate_generative_settings(model_type, model_def, inputs)
-        if error is not None and len(error) > 0:
-            gr.Info(error)
-            return
-    if inputs.get("cfg_star_switch", 0) != 0 and inputs.get("apg_switch", 0) != 0:
-        gr.Info("Adaptive Progressive Guidance and Classifier Free Guidance Star can not be set at the same time")
-        return 
-    prompt = inputs["prompt"]
-    if len(prompt) ==0:
-        gr.Info("Prompt cannot be empty.")
-        gen = get_gen_info(state)
-        queue = gen.get("queue", [])
-        return get_queue_table(queue)
-    prompt, errors = prompt_parser.process_template(prompt)
-    if len(errors) > 0:
-        gr.Info("Error processing prompt template: " + errors)
-        return
-    model_filename = get_model_filename(model_type)  
-    prompts = prompt.replace("\r", "").split("\n")
-    prompts = [prompt.strip() for prompt in prompts if len(prompt.strip())>0 and not prompt.startswith("#")]
-    if len(prompts) == 0:
-        gr.Info("Prompt cannot be empty.")
-        gen = get_gen_info(state)
-        queue = gen.get("queue", [])
-        return get_queue_table(queue)
-
-    resolution = inputs["resolution"]
-    width, height = resolution.split("x")
-    width, height = int(width), int(height)
-    image_start = inputs["image_start"]
-    image_end = inputs["image_end"]
-    image_refs = inputs["image_refs"]
-    image_prompt_type = inputs["image_prompt_type"]
-    audio_prompt_type = inputs["audio_prompt_type"]
-    if image_prompt_type == None: image_prompt_type = ""
-    video_prompt_type = inputs["video_prompt_type"]
-    if video_prompt_type == None: video_prompt_type = ""
-    force_fps = inputs["force_fps"]
-    audio_guide = inputs["audio_guide"]
-    audio_guide2 = inputs["audio_guide2"]
-    audio_source = inputs["audio_source"]
-    video_guide = inputs["video_guide"]
-    image_guide = inputs["image_guide"]
-    video_mask = inputs["video_mask"]
-    image_mask = inputs["image_mask"]
-    speakers_locations = inputs["speakers_locations"]
-    video_source = inputs["video_source"]
-    frames_positions = inputs["frames_positions"]
-    keep_frames_video_guide= inputs["keep_frames_video_guide"] 
-    keep_frames_video_source = inputs["keep_frames_video_source"]
-    denoising_strength= inputs["denoising_strength"]     
-    sliding_window_size = inputs["sliding_window_size"]
-    sliding_window_overlap = inputs["sliding_window_overlap"]
-    sliding_window_discard_last_frames = inputs["sliding_window_discard_last_frames"]
-    video_length = inputs["video_length"]
-    num_inference_steps= inputs["num_inference_steps"]
-    skip_steps_cache_type= inputs["skip_steps_cache_type"]
-    MMAudio_setting = inputs["MMAudio_setting"]
-    image_mode = inputs["image_mode"]
-    switch_threshold = inputs["switch_threshold"]
-    loras_multipliers = inputs["loras_multipliers"]
-    activated_loras = inputs["activated_loras"]
-    guidance_phases= inputs["guidance_phases"]
-    model_switch_phase = inputs["model_switch_phase"]    
-    switch_threshold = inputs["switch_threshold"]
-    switch_threshold2 = inputs["switch_threshold2"]
-    
-
-    if len(loras_multipliers) > 0:
-        _, _, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases= guidance_phases)
-        if len(errors) > 0: 
-            gr.Info(f"Error parsing Loras Multipliers: {errors}")
-            return
-    if guidance_phases == 3:
-        if switch_threshold < switch_threshold2:
-            gr.Info(f"Phase 1-2 Switch Noise Level ({switch_threshold}) should be Greater than Phase 2-3 Switch Noise Level ({switch_threshold2}). As a reminder, noise will gradually go down from 1000 to 0.")
-            return
-    else:
-        model_switch_phase = 1
-        
-    if not any_steps_skipping: skip_steps_cache_type = ""
-    if not model_def.get("lock_inference_steps", False) and model_type in ["ltxv_13B"] and num_inference_steps < 20:
-        gr.Info("The minimum number of steps should be 20") 
-        return
-    if skip_steps_cache_type == "mag":
-        if num_inference_steps > 50:
-            gr.Info("Mag Cache maximum number of steps is 50")
-            return
-        
-    if image_mode == 1:
-        audio_prompt_type = ""
-
-    if "B" in audio_prompt_type or "X" in audio_prompt_type:
-        from models.wan.multitalk.multitalk import parse_speakers_locations
-        speakers_bboxes, error = parse_speakers_locations(speakers_locations)
-        if len(error) > 0:
-            gr.Info(error)
-            return
-
-    if MMAudio_setting != 0 and server_config.get("mmaudio_enabled", 0) != 0 and video_length <16: #should depend on the architecture
-        gr.Info("MMAudio can generate an Audio track only if the Video is at least 1s long")
-    if "F" in video_prompt_type:
-        if len(frames_positions.strip()) > 0:
-            positions = frames_positions.split(" ")
-            for pos_str in positions:
-                if not is_integer(pos_str):
-                    gr.Info(f"Invalid Frame Position '{pos_str}'")
-                    return
-                pos = int(pos_str)
-                if pos <1 or pos > max_source_video_frames:
-                    gr.Info(f"Invalid Frame Position Value'{pos_str}'")
-                    return
-    else:
-        frames_positions = None
-
-    if audio_source is not None and MMAudio_setting != 0:
-        gr.Info("MMAudio and Custom Audio Soundtrack can't not be used at the same time")
-        return
-    if len(filter_letters(image_prompt_type, "VLG")) > 0 and len(keep_frames_video_source) > 0:
-        if not is_integer(keep_frames_video_source) or int(keep_frames_video_source) == 0:
-            gr.Info("The number of frames to keep must be a non null integer") 
-            return
-    else:
-        keep_frames_video_source = ""
-
-    if "V" in image_prompt_type:
-        if video_source == None:
-            gr.Info("You must provide a Source Video file to continue")
-            return
-    else:
-        video_source = None
-
-    if "A" in audio_prompt_type:
-        if audio_guide == None:
-            gr.Info("You must provide an Audio Source")
-            return
-        if "B" in audio_prompt_type:
-            if audio_guide2 == None:
-                gr.Info("You must provide a second Audio Source")
-                return
-        else:
-            audio_guide2 = None
-    else:
-        audio_guide = None
-        audio_guide2 = None
-        
-    if model_type in ["vace_multitalk_14B"] and ("B" in audio_prompt_type or "X" in audio_prompt_type):
-        if not "I" in video_prompt_type and not not "V" in video_prompt_type:
-            gr.Info("To get good results with Multitalk and two people speaking, it is recommended to set a Reference Frame or a Control Video (potentially truncated) that contains the two people one on each side")
-
-    if model_def.get("one_image_ref_needed", False):
-        if image_refs  == None :
-            gr.Info("You must provide an Image Reference") 
-            return
-        if len(image_refs) > 1:
-            gr.Info("Only one Image Reference (a person) is supported for the moment by this model") 
-            return
-    if model_def.get("at_least_one_image_ref_needed", False):
-        if image_refs  == None :
-            gr.Info("You must provide at least one Image Reference") 
-            return
-        
-    if "I" in video_prompt_type:
-        if image_refs == None or len(image_refs) == 0:
-            gr.Info("You must provide at least one Refererence Image")
-            return
-        if any(isinstance(image[0], str) for image in image_refs) :
-            gr.Info("A Reference Image should be an Image") 
-            return
-        if isinstance(image_refs, list):
-            image_refs = [ convert_image(tup[0]) for tup in image_refs ]        
-    else:
-        image_refs = None
-
-    if "V" in video_prompt_type:
-        if image_outputs:
-            if image_guide is None:
-                gr.Info("You must provide a Control Image")
-                return
-        else:
-            if video_guide is None:
-                gr.Info("You must provide a Control Video")
-                return
-        if "A" in video_prompt_type and not "U" in video_prompt_type:             
-            if image_outputs:
-                if image_mask is None:
-                    gr.Info("You must provide a Image Mask")
-                    return
-            else:
-                if video_mask is None:
-                    gr.Info("You must provide a Video Mask")
-                    return
-        else:
-            video_mask = None
-            image_mask = None
-
-        if "G" in video_prompt_type:
-            gr.Info(f"With Denoising Strength {denoising_strength:.1f}, denoising will start a Step no {int(num_inference_steps * (1. - denoising_strength))} ")
-        else: 
-            denoising_strength = 1.0
-        if len(keep_frames_video_guide) > 0 and model_type in ["ltxv_13B"]:
-            gr.Info("Keep Frames for Control Video is not supported with LTX Video")
-            return
-        _, error = parse_keep_frames_video_guide(keep_frames_video_guide, video_length)
-        if len(error) > 0:
-            gr.Info(f"Invalid Keep Frames property: {error}")
-            return
-    else:
-        video_guide = None
-        image_guide = None
-        video_mask = None
-        image_mask = None
-        keep_frames_video_guide = ""
-        denoising_strength = 1.0
-    
-    if image_outputs:
-        video_guide = None
-        video_mask = None
-    else:
-        image_guide = None
-        image_mask = None
-
-
-    if "S" in image_prompt_type:
-        if image_start == None or isinstance(image_start, list) and len(image_start) == 0:
-            gr.Info("You must provide a Start Image")
-            return
-        if not isinstance(image_start, list):
-            image_start = [image_start]
-        if not all( not isinstance(img[0], str) for img in image_start) :
-            gr.Info("Start Image should be an Image") 
-            return
-        image_start = [ convert_image(tup[0]) for tup in image_start ]
-    else:
-        image_start = None
-
-    if "E" in image_prompt_type:
-        if image_end == None or isinstance(image_end, list) and len(image_end) == 0:
-            gr.Info("You must provide an End Image") 
-            return
-        if not isinstance(image_end, list):
-            image_end = [image_end]
-        if not all( not isinstance(img[0], str) for img in image_end) :
-            gr.Info("End Image should be an Image") 
-            return
-        if len(image_start) != len(image_end):
-            gr.Info("The number of Start and End Images should be the same ")
-            return         
-        image_end = [ convert_image(tup[0]) for tup in image_end ]
-    else:        
-        image_end = None
-
-
-    if test_any_sliding_window(model_type) and image_mode == 0:
-        if video_length > sliding_window_size:
-            full_video_length = video_length if video_source is None else video_length +  sliding_window_overlap
-            extra = "" if full_video_length == video_length else f" including {sliding_window_overlap} added for Video Continuation"
-            no_windows = compute_sliding_window_no(full_video_length, sliding_window_size, sliding_window_discard_last_frames, sliding_window_overlap)
-            gr.Info(f"The Number of Frames to generate ({video_length}{extra}) is greater than the Sliding Window Size ({sliding_window_size}), {no_windows} Windows will be generated")
-
-    if "recam" in model_filename:
-        if video_source == None:
-            gr.Info("You must provide a Source Video")
-            return
-        
-        frames = get_resampled_video(video_source, 0, 81, get_computed_fps(force_fps, model_type , video_guide, video_source ))
-        if len(frames)<81:
-            gr.Info("Recammaster source video should be at least 81 frames once the resampling at 16 fps has been done")
-            return
-
-
-
-    if "hunyuan_custom_custom_edit" in model_filename:
-        if len(keep_frames_video_guide) > 0: 
-            gr.Info("Filtering Frames with this model is not supported")
-            return
-
-    if inputs["multi_prompts_gen_type"] != 0:
-        if image_start != None and len(image_start) > 1:
-            gr.Info("Only one Start Image must be provided if multiple prompts are used for different windows") 
-            return
-
-        if image_end != None and len(image_end) > 1:
-            gr.Info("Only one End Image must be provided if multiple prompts are used for different windows") 
-            return
-
-    override_inputs = {
-        "image_start": image_start[0] if image_start !=None and len(image_start) > 0 else None,
-        "image_end": image_end[0] if image_end !=None and len(image_end) > 0 else None,
-        "image_refs": image_refs,
-        "audio_guide": audio_guide,
-        "audio_guide2": audio_guide2,
-        "audio_source": audio_source,
-        "video_guide": video_guide,
-        "image_guide": image_guide,
-        "video_mask": video_mask,
-        "image_mask": image_mask,
-        "video_source": video_source,
-        "frames_positions": frames_positions,
-        "keep_frames_video_source": keep_frames_video_source,
-        "keep_frames_video_guide": keep_frames_video_guide,
-        "denoising_strength": denoising_strength,
-        "image_prompt_type": image_prompt_type,
-        "video_prompt_type": video_prompt_type,        
-        "audio_prompt_type": audio_prompt_type,
-        "skip_steps_cache_type": skip_steps_cache_type,
-        "model_switch_phase": model_switch_phase,
-    } 
-
-    if inputs["multi_prompts_gen_type"] == 0:
-        if image_start != None and len(image_start) > 0:
-            if inputs["multi_images_gen_type"] == 0:
-                new_prompts = []
-                new_image_start = []
-                new_image_end = []
-                for i in range(len(prompts) * len(image_start) ):
-                    new_prompts.append(  prompts[ i % len(prompts)] )
-                    new_image_start.append(image_start[i // len(prompts)] )
-                    if image_end != None:
-                        new_image_end.append(image_end[i // len(prompts)] )
-                prompts = new_prompts
-                image_start = new_image_start 
-                if image_end != None:
-                    image_end = new_image_end 
-            else:
-                if len(prompts) >= len(image_start):
-                    if len(prompts) % len(image_start) != 0:
-                        gr.Info("If there are more text prompts than input images the number of text prompts should be dividable by the number of images")
-                        return
-                    rep = len(prompts) // len(image_start)
-                    new_image_start = []
-                    new_image_end = []
-                    for i, _ in enumerate(prompts):
-                        new_image_start.append(image_start[i//rep] )
-                        if image_end != None:
-                            new_image_end.append(image_end[i//rep] )
-                    image_start = new_image_start 
-                    if image_end != None:
-                        image_end = new_image_end 
-                else: 
-                    if len(image_start) % len(prompts)  !=0:
-                        gr.Info("If there are more input images than text prompts the number of images should be dividable by the number of text prompts")
-                        return
-                    rep = len(image_start) // len(prompts)  
-                    new_prompts = []
-                    for i, _ in enumerate(image_start):
-                        new_prompts.append(  prompts[ i//rep] )
-                    prompts = new_prompts
-            if image_end == None or len(image_end) == 0:
-                image_end = [None] * len(prompts)
-
-            for single_prompt, start, end in zip(prompts, image_start, image_end) :
-                override_inputs.update({
-                    "prompt" : single_prompt,
-                    "image_start": start,
-                    "image_end" : end,
-                })
-                inputs.update(override_inputs) 
-                add_video_task(**inputs)
-        else:
-            for single_prompt in prompts :
-                override_inputs["prompt"] = single_prompt 
-                inputs.update(override_inputs) 
-                add_video_task(**inputs)
-    else:
-        override_inputs["prompt"] = "\n".join(prompts)
-        inputs.update(override_inputs) 
-        add_video_task(**inputs)
-
-    gen["prompts_max"] = len(prompts) + gen.get("prompts_max",0)
-    state["validate_success"] = 1
-    queue= gen.get("queue", [])
-    return update_queue_data(queue)
-
 def get_preview_images(inputs):
     inputs_to_query = ["image_start", "image_end", "video_source", "video_guide", "image_guide", "video_mask", "image_mask", "image_refs" ]
     labels = ["Start Image", "End Image", "Video Source", "Video Guide", "Image Guide", "Video Mask", "Image Mask", "Image Reference"]
@@ -768,32 +362,6 @@ def get_preview_images(inputs):
         start_image_labels = start_image_labels [:1] 
     return start_image_data, end_image_data, start_image_labels, end_image_labels 
 
-def add_video_task(**inputs):
-    global task_id
-    state = inputs["state"]
-    gen = get_gen_info(state)
-    queue = gen["queue"]
-    task_id += 1
-    current_task_id = task_id
-
-    start_image_data, end_image_data, start_image_labels, end_image_labels = get_preview_images(inputs)
-
-    queue.append({
-        "id": current_task_id,
-        "params": inputs.copy(),
-        "repeats": inputs["repeat_generation"],
-        "length": inputs["video_length"], # !!!
-        "steps": inputs["num_inference_steps"],
-        "prompt": inputs["prompt"],
-        "start_image_labels": start_image_labels,
-        "end_image_labels": end_image_labels,
-        "start_image_data": start_image_data,
-        "end_image_data": end_image_data,
-        "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
-        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
-    })
-    return update_queue_data(queue)
-
 def update_task_thumbnails(task,  inputs):
     start_image_data, end_image_data, start_labels, end_labels = get_preview_images(inputs)
 
@@ -803,633 +371,6 @@ def update_task_thumbnails(task,  inputs):
         "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
         "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
     })
-
-def move_up(queue, selected_indices):
-    if not selected_indices or len(selected_indices) == 0:
-        return update_queue_data(queue)
-    idx = selected_indices[0]
-    if isinstance(idx, list):
-        idx = idx[0]
-    idx = int(idx)
-    with lock:
-        idx += 1
-        if idx > 1:
-            queue[idx], queue[idx-1] = queue[idx-1], queue[idx]
-        elif idx == 1:
-            queue[:] = queue[0:1] + queue[2:] + queue[1:2]
-
-    return update_queue_data(queue)
-
-def move_down(queue, selected_indices):
-    if not selected_indices or len(selected_indices) == 0:
-        return update_queue_data(queue)
-    idx = selected_indices[0]
-    if isinstance(idx, list):
-        idx = idx[0]
-    idx = int(idx)
-    with lock:
-        idx += 1
-        if idx < len(queue)-1:
-            queue[idx], queue[idx+1] = queue[idx+1], queue[idx]
-        elif idx == len(queue)-1:
-            queue[:] = queue[0:1] + queue[-1:] + queue[1:-1]
-
-    return update_queue_data(queue)
-
-def remove_task(queue, selected_indices):
-    if not selected_indices or len(selected_indices) == 0:
-        return update_queue_data(queue)
-    idx = selected_indices[0]
-    if isinstance(idx, list):
-        idx = idx[0]
-    idx = int(idx) + 1
-    with lock:
-        if idx < len(queue):
-            if idx == 0:
-                wan_model._interrupt = True
-            del queue[idx]
-    return update_queue_data(queue)
-
-def update_global_queue_ref(queue):
-    global global_queue_ref
-    with lock:
-        global_queue_ref = queue[:]
-
-def save_queue_action(state):
-    gen = get_gen_info(state)
-    queue = gen.get("queue", [])
-
-    if not queue or len(queue) <=1 :
-        gr.Info("Queue is empty. Nothing to save.")
-        return ""
-
-    zip_buffer = io.BytesIO()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        queue_manifest = []
-        file_paths_in_zip = {}
-
-        for task_index, task in enumerate(queue):
-            if task is None or not isinstance(task, dict) or task.get('id') is None: continue
-
-            params_copy = task.get('params', {}).copy()
-            task_id_s = task.get('id', f"task_{task_index}")
-
-            image_keys = ["image_start", "image_end", "image_refs", "image_guide", "image_mask"]
-            video_keys = ["video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_source"]
-
-            for key in image_keys:
-                images_pil = params_copy.get(key)
-                if images_pil is None:
-                    continue
-
-                is_originally_list = isinstance(images_pil, list)
-                if not is_originally_list:
-                    images_pil = [images_pil]
-
-                image_filenames_for_json = []
-                for img_index, pil_image in enumerate(images_pil):
-                    if not isinstance(pil_image, Image.Image):
-                         print(f"Warning: Expected PIL Image for key '{key}' in task {task_id_s}, got {type(pil_image)}. Skipping image.")
-                         continue
-
-                    img_id = id(pil_image)
-                    if img_id in file_paths_in_zip:
-                         image_filenames_for_json.append(file_paths_in_zip[img_id])
-                         continue
-
-                    img_filename_in_zip = f"task{task_id_s}_{key}_{img_index}.png"
-                    img_save_path = os.path.join(tmpdir, img_filename_in_zip)
-
-                    try:
-                        pil_image.save(img_save_path, "PNG")
-                        image_filenames_for_json.append(img_filename_in_zip)
-                        file_paths_in_zip[img_id] = img_filename_in_zip
-                        print(f"Saved image: {img_filename_in_zip}")
-                    except Exception as e:
-                        print(f"Error saving image {img_filename_in_zip} for task {task_id_s}: {e}")
-
-                if image_filenames_for_json:
-                     params_copy[key] = image_filenames_for_json if is_originally_list else image_filenames_for_json[0]
-                else:
-                     pass
-                    #  params_copy.pop(key, None) #cant pop otherwise crash during reload
-
-            for key in video_keys:
-                video_path_orig = params_copy.get(key)
-                if video_path_orig is None or not isinstance(video_path_orig, str):
-                    continue
-
-                if video_path_orig in file_paths_in_zip:
-                    params_copy[key] = file_paths_in_zip[video_path_orig]
-                    continue
-
-                if not os.path.isfile(video_path_orig):
-                    print(f"Warning: Video file not found for key '{key}' in task {task_id_s}: {video_path_orig}. Skipping video.")
-                    params_copy.pop(key, None)
-                    continue
-
-                _, extension = os.path.splitext(video_path_orig)
-                vid_filename_in_zip = f"task{task_id_s}_{key}{extension if extension else '.mp4'}"
-                vid_save_path = os.path.join(tmpdir, vid_filename_in_zip)
-
-                try:
-                    shutil.copy2(video_path_orig, vid_save_path)
-                    params_copy[key] = vid_filename_in_zip
-                    file_paths_in_zip[video_path_orig] = vid_filename_in_zip
-                    print(f"Copied video: {video_path_orig} -> {vid_filename_in_zip}")
-                except Exception as e:
-                    print(f"Error copying video {video_path_orig} to {vid_filename_in_zip} for task {task_id_s}: {e}")
-                    params_copy.pop(key, None)
-
-
-            params_copy.pop('state', None)
-            params_copy.pop('start_image_labels', None)
-            params_copy.pop('end_image_labels', None)
-            params_copy.pop('start_image_data_base64', None)
-            params_copy.pop('end_image_data_base64', None)
-            params_copy.pop('start_image_data', None)
-            params_copy.pop('end_image_data', None)
-            task.pop('start_image_data', None)
-            task.pop('end_image_data', None)
-
-            manifest_entry = {
-                "id": task.get('id'),
-                "params": params_copy,
-            }
-            manifest_entry = {k: v for k, v in manifest_entry.items() if v is not None}
-            queue_manifest.append(manifest_entry)
-
-        manifest_path = os.path.join(tmpdir, "queue.json")
-        try:
-            with open(manifest_path, 'w', encoding='utf-8') as f:
-                json.dump(queue_manifest, f, indent=4)
-        except Exception as e:
-            print(f"Error writing queue.json: {e}")
-            gr.Warning("Failed to create queue manifest.")
-            return None
-
-        try:
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                zf.write(manifest_path, arcname="queue.json")
-
-                for file_id, saved_file_rel_path in file_paths_in_zip.items():
-                    saved_file_abs_path = os.path.join(tmpdir, saved_file_rel_path)
-                    if os.path.exists(saved_file_abs_path):
-                        zf.write(saved_file_abs_path, arcname=saved_file_rel_path)
-                        print(f"Adding to zip: {saved_file_rel_path}")
-                    else:
-                        print(f"Warning: File {saved_file_rel_path} (ID: {file_id}) not found during zipping.")
-
-            zip_buffer.seek(0)
-            zip_binary_content = zip_buffer.getvalue()
-            zip_base64 = base64.b64encode(zip_binary_content).decode('utf-8')
-            print(f"Queue successfully prepared as base64 string ({len(zip_base64)} chars).")
-            return zip_base64
-
-        except Exception as e:
-            print(f"Error creating zip file in memory: {e}")
-            gr.Warning("Failed to create zip data for download.")
-            return None
-        finally:
-            zip_buffer.close()
-
-def load_queue_action(filepath, state, evt:gr.EventData):
-    global task_id
-
-    gen = get_gen_info(state)
-    original_queue = gen.get("queue", [])
-    delete_autoqueue_file  = False 
-    if evt.target == None:
-
-        if original_queue or not Path(AUTOSAVE_FILENAME).is_file():
-            return update_queue_data(original_queue)
-        print(f"Autoloading queue from {AUTOSAVE_FILENAME}...")
-        filename = AUTOSAVE_FILENAME
-        delete_autoqueue_file = True
-        
-        # Check if the file is actually a valid zip file
-        try:
-            with zipfile.ZipFile(filename, 'r') as test_zip:
-                test_zip.testzip()  # This will raise an exception if the zip is corrupted
-        except (zipfile.BadZipFile, Exception) as e:
-            print(f"Corrupted autosave file detected: {e}")
-            try:
-                os.remove(filename)
-                print(f"Removed corrupted autosave file: {filename}")
-            except Exception as remove_error:
-                print(f"Could not remove corrupted file: {remove_error}")
-            return update_queue_data(original_queue)
-    else:
-        if not filepath or not hasattr(filepath, 'name') or not Path(filepath.name).is_file():
-            print("[load_queue_action] Warning: No valid file selected or file not found.")
-            return update_queue_data(original_queue)
-        filename = filepath.name
-
-
-    save_path_base = server_config.get("save_path", "outputs")
-    loaded_cache_dir = os.path.join(save_path_base, "_loaded_queue_cache")
-
-
-    newly_loaded_queue = []
-    max_id_in_file = 0
-    error_message = ""
-    local_queue_copy_for_global_ref = None
-
-    try:
-        print(f"[load_queue_action] Attempting to load queue from: {filename}")
-        os.makedirs(loaded_cache_dir, exist_ok=True)
-        print(f"[load_queue_action] Using cache directory: {loaded_cache_dir}")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with zipfile.ZipFile(filename, 'r') as zf:
-                if "queue.json" not in zf.namelist(): raise ValueError("queue.json not found in zip file")
-                print(f"[load_queue_action] Extracting {filename} to {tmpdir}")
-                zf.extractall(tmpdir)
-                print(f"[load_queue_action] Extraction complete.")
-
-            manifest_path = os.path.join(tmpdir, "queue.json")
-            print(f"[load_queue_action] Reading manifest: {manifest_path}")
-            with open(manifest_path, 'r', encoding='utf-8') as f:
-                loaded_manifest = json.load(f)
-            print(f"[load_queue_action] Manifest loaded. Processing {len(loaded_manifest)} tasks.")
-
-            for task_index, task_data in enumerate(loaded_manifest):
-                if task_data is None or not isinstance(task_data, dict):
-                    print(f"[load_queue_action] Skipping invalid task data at index {task_index}")
-                    continue
-
-                params = task_data.get('params', {})
-                task_id_loaded = task_data.get('id', 0)
-                max_id_in_file = max(max_id_in_file, task_id_loaded)
-                params['state'] = state
-
-                image_keys = ["image_start", "image_end", "image_refs", "image_guide", "image_mask"]
-                video_keys = ["video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_source"]
-
-                loaded_pil_images = {}
-                loaded_video_paths = {}
-
-                for key in image_keys:
-                    image_filenames = params.get(key)
-                    if image_filenames is None: continue
-
-                    is_list = isinstance(image_filenames, list)
-                    if not is_list: image_filenames = [image_filenames]
-
-                    loaded_pils = []
-                    for img_filename_in_zip in image_filenames:
-                         if not isinstance(img_filename_in_zip, str):
-                             print(f"[load_queue_action] Warning: Non-string filename found for image key '{key}'. Skipping.")
-                             continue
-                         img_load_path = os.path.join(tmpdir, img_filename_in_zip)
-                         if not os.path.exists(img_load_path):
-                             print(f"[load_queue_action] Image file not found in extracted data: {img_load_path}. Skipping.")
-                             continue
-                         try:
-                             pil_image = Image.open(img_load_path)
-                             pil_image.load()
-                             converted_image = convert_image(pil_image)
-                             loaded_pils.append(converted_image)
-                             pil_image.close()
-                             print(f"Loaded image: {img_filename_in_zip} for key {key}")
-                         except Exception as img_e:
-                             print(f"[load_queue_action] Error loading image {img_filename_in_zip}: {img_e}")
-                    if loaded_pils:
-                        params[key] = loaded_pils if is_list else loaded_pils[0]
-                        loaded_pil_images[key] = params[key]
-                    else:
-                        params.pop(key, None)
-
-                for key in video_keys:
-                    video_filename_in_zip = params.get(key)
-                    if video_filename_in_zip is None or not isinstance(video_filename_in_zip, str):
-                        continue
-
-                    video_load_path = os.path.join(tmpdir, video_filename_in_zip)
-                    if not os.path.exists(video_load_path):
-                        print(f"[load_queue_action] Video file not found in extracted data: {video_load_path}. Skipping.")
-                        params.pop(key, None)
-                        continue
-
-                    persistent_video_path = os.path.join(loaded_cache_dir, video_filename_in_zip)
-                    try:
-                        shutil.copy2(video_load_path, persistent_video_path)
-                        params[key] = persistent_video_path
-                        loaded_video_paths[key] = persistent_video_path
-                        print(f"Loaded video: {video_filename_in_zip} -> {persistent_video_path}")
-                    except Exception as vid_e:
-                        print(f"[load_queue_action] Error copying video {video_filename_in_zip} to cache: {vid_e}")
-                        params.pop(key, None)
-
-                primary_preview_pil_list, secondary_preview_pil_list, primary_preview_pil_labels, secondary_preview_pil_labels  = get_preview_images(params)
-
-                start_b64 = [pil_to_base64_uri(primary_preview_pil_list[0], format="jpeg", quality=70)] if isinstance(primary_preview_pil_list, list) and primary_preview_pil_list else None
-                end_b64 = [pil_to_base64_uri(secondary_preview_pil_list[0], format="jpeg", quality=70)] if isinstance(secondary_preview_pil_list, list) and secondary_preview_pil_list else None
-
-                top_level_start_image = params.get("image_start") or params.get("image_refs")
-                top_level_end_image = params.get("image_end")
-
-                runtime_task = {
-                    "id": task_id_loaded,
-                    "params": params.copy(),
-                    "repeats": params.get('repeat_generation', 1),
-                    "length": params.get('video_length'),
-                    "steps": params.get('num_inference_steps'),
-                    "prompt": params.get('prompt'),
-                    "start_image_labels": primary_preview_pil_labels,
-                    "end_image_labels": secondary_preview_pil_labels,
-                    "start_image_data": top_level_start_image,
-                    "end_image_data": top_level_end_image,
-                    "start_image_data_base64": start_b64,
-                    "end_image_data_base64": end_b64,
-                }
-                newly_loaded_queue.append(runtime_task)
-                print(f"[load_queue_action] Reconstructed task {task_index+1}/{len(loaded_manifest)}, ID: {task_id_loaded}")
-
-        with lock:
-            print("[load_queue_action] Acquiring lock to update state...")
-            gen["queue"] = newly_loaded_queue[:]
-            local_queue_copy_for_global_ref = gen["queue"][:]
-
-            current_max_id_in_new_queue = max([t['id'] for t in newly_loaded_queue if 'id' in t] + [0])
-            if current_max_id_in_new_queue >= task_id:
-                 new_task_id = current_max_id_in_new_queue + 1
-                 print(f"[load_queue_action] Updating global task_id from {task_id} to {new_task_id}")
-                 task_id = new_task_id
-            else:
-                 print(f"[load_queue_action] Global task_id ({task_id}) is > max in file ({current_max_id_in_new_queue}). Not changing task_id.")
-
-            gen["prompts_max"] = len(newly_loaded_queue)
-            print("[load_queue_action] State update complete. Releasing lock.")
-
-        if local_queue_copy_for_global_ref is not None:
-             print("[load_queue_action] Updating global queue reference...")
-             update_global_queue_ref(local_queue_copy_for_global_ref)
-        else:
-             print("[load_queue_action] Warning: Skipping global ref update as local copy is None.")
-
-        print(f"[load_queue_action] Queue load successful. Returning DataFrame update for {len(newly_loaded_queue)} tasks.")
-        return update_queue_data(newly_loaded_queue)
-
-    except (ValueError, zipfile.BadZipFile, FileNotFoundError, Exception) as e:
-        error_message = f"Error during queue load: {e}"
-        print(f"[load_queue_action] Caught error: {error_message}")
-        traceback.print_exc()
-        gr.Warning(f"Failed to load queue: {error_message[:200]}")
-
-        print("[load_queue_action] Load failed. Returning DataFrame update for original queue.")
-        return update_queue_data(original_queue)
-    finally:
-        if delete_autoqueue_file:
-            if os.path.isfile(filename):
-                os.remove(filename)
-                print(f"Clear Queue: Deleted autosave file '{filename}'.")
-
-        if filepath and hasattr(filepath, 'name') and filepath.name and os.path.exists(filepath.name):
-             if tempfile.gettempdir() in os.path.abspath(filepath.name):
-                 try:
-                     os.remove(filepath.name)
-                     print(f"[load_queue_action] Removed temporary upload file: {filepath.name}")
-                 except OSError as e:
-                     print(f"[load_queue_action] Info: Could not remove temp file {filepath.name}: {e}")
-             else:
-                  print(f"[load_queue_action] Info: Did not remove non-temporary file: {filepath.name}")
-
-def clear_queue_action(state):
-    gen = get_gen_info(state)
-    queue = gen.get("queue", [])
-    aborted_current = False
-    cleared_pending = False
-
-    with lock:
-        if "in_progress" in gen and gen["in_progress"]:
-            print("Clear Queue: Signalling abort for in-progress task.")
-            gen["abort"] = True
-            gen["extra_orders"] = 0
-            if wan_model is not None:
-                wan_model._interrupt = True
-            aborted_current = True
-
-        if queue:
-             if len(queue) > 1 or (len(queue) == 1 and queue[0] is not None and queue[0].get('id') is not None):
-                 print(f"Clear Queue: Clearing {len(queue)} tasks from queue.")
-                 queue.clear()
-                 cleared_pending = True
-             else:
-                 pass
-
-        if aborted_current or cleared_pending:
-            gen["prompts_max"] = 0
-
-    if cleared_pending:
-        try:
-            if os.path.isfile(AUTOSAVE_FILENAME):
-                os.remove(AUTOSAVE_FILENAME)
-                print(f"Clear Queue: Deleted autosave file '{AUTOSAVE_FILENAME}'.")
-        except OSError as e:
-            print(f"Clear Queue: Error deleting autosave file '{AUTOSAVE_FILENAME}': {e}")
-            gr.Warning(f"Could not delete the autosave file '{AUTOSAVE_FILENAME}'. You may need to remove it manually.")
-
-    if aborted_current and cleared_pending:
-        gr.Info("Queue cleared and current generation aborted.")
-    elif aborted_current:
-        gr.Info("Current generation aborted.")
-    elif cleared_pending:
-        gr.Info("Queue cleared.")
-    else:
-        gr.Info("Queue is already empty or only contains the active task (which wasn't aborted now).")
-
-    return update_queue_data([])
-
-def quit_application():
-    print("Save and Quit requested...")
-    autosave_queue()
-    import signal
-    os.kill(os.getpid(), signal.SIGINT)
-
-def start_quit_process():
-    return 5, gr.update(visible=False), gr.update(visible=True)
-
-def cancel_quit_process():
-    return -1, gr.update(visible=True), gr.update(visible=False)
-
-def show_countdown_info_from_state(current_value: int):
-    if current_value > 0:
-        gr.Info(f"Quitting in {current_value}...")
-        return current_value - 1
-    return current_value
-quitting_app = False
-def autosave_queue():
-    global quitting_app
-    quitting_app = True
-    global global_queue_ref
-    if not global_queue_ref:
-        print("Autosave: Queue is empty, nothing to save.")
-        return
-
-    print(f"Autosaving queue ({len(global_queue_ref)} items) to {AUTOSAVE_FILENAME}...")
-    temp_state_for_save = {"gen": {"queue": global_queue_ref}}
-    zip_file_path = None
-    try:
-
-        def _save_queue_to_file(queue_to_save, output_filename):
-             if not queue_to_save: return None
-
-             with tempfile.TemporaryDirectory() as tmpdir:
-                queue_manifest = []
-                file_paths_in_zip = {}
-
-                for task_index, task in enumerate(queue_to_save):
-                    if task is None or not isinstance(task, dict) or task.get('id') is None: continue
-
-                    params_copy = task.get('params', {}).copy()
-                    task_id_s = task.get('id', f"task_{task_index}")
-
-                    image_keys = ["image_start", "image_end", "image_refs", "image_guide", "image_mask"]
-                    video_keys = ["video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_source" ]
-
-                    for key in image_keys:
-                        images_pil = params_copy.get(key)
-                        if images_pil is None: continue
-                        is_list = isinstance(images_pil, list)
-                        if not is_list: images_pil = [images_pil]
-                        image_filenames_for_json = []
-                        for img_index, pil_image in enumerate(images_pil):
-                            if not isinstance(pil_image, Image.Image): continue
-                            img_id = id(pil_image)
-                            if img_id in file_paths_in_zip:
-                                image_filenames_for_json.append(file_paths_in_zip[img_id])
-                                continue
-                            img_filename_in_zip = f"task{task_id_s}_{key}_{img_index}.png"
-                            img_save_path = os.path.join(tmpdir, img_filename_in_zip)
-                            try:
-                                pil_image.save(img_save_path, "PNG")
-                                image_filenames_for_json.append(img_filename_in_zip)
-                                file_paths_in_zip[img_id] = img_filename_in_zip
-                            except Exception as e:
-                                print(f"Autosave error saving image {img_filename_in_zip}: {e}")
-                        if image_filenames_for_json:
-                            params_copy[key] = image_filenames_for_json if is_list else image_filenames_for_json[0]
-                        else:
-                            params_copy.pop(key, None)
-
-                    for key in video_keys:
-                        video_path_orig = params_copy.get(key)
-                        if video_path_orig is None or not isinstance(video_path_orig, str):
-                            continue
-
-                        if video_path_orig in file_paths_in_zip:
-                            params_copy[key] = file_paths_in_zip[video_path_orig]
-                            continue
-
-                        if not os.path.isfile(video_path_orig):
-                            print(f"Warning (Autosave): Video file not found for key '{key}' in task {task_id_s}: {video_path_orig}. Skipping.")
-                            params_copy.pop(key, None)
-                            continue
-
-                        _, extension = os.path.splitext(video_path_orig)
-                        vid_filename_in_zip = f"task{task_id_s}_{key}{extension if extension else '.mp4'}"
-                        vid_save_path = os.path.join(tmpdir, vid_filename_in_zip)
-
-                        try:
-                            shutil.copy2(video_path_orig, vid_save_path)
-                            params_copy[key] = vid_filename_in_zip
-                            file_paths_in_zip[video_path_orig] = vid_filename_in_zip
-                        except Exception as e:
-                            print(f"Error (Autosave) copying video {video_path_orig} to {vid_filename_in_zip} for task {task_id_s}: {e}")
-                            params_copy.pop(key, None)
-                    params_copy.pop('state', None)
-                    params_copy.pop('start_image_data_base64', None)
-                    params_copy.pop('end_image_data_base64', None)
-                    params_copy.pop('start_image_data', None)
-                    params_copy.pop('end_image_data', None)
-
-                    manifest_entry = {
-                        "id": task.get('id'),
-                        "params": params_copy,
-                    }
-                    manifest_entry = {k: v for k, v in manifest_entry.items() if v is not None}
-                    queue_manifest.append(manifest_entry)
-
-                manifest_path = os.path.join(tmpdir, "queue.json")
-                with open(manifest_path, 'w', encoding='utf-8') as f: json.dump(queue_manifest, f, indent=4)
-                with zipfile.ZipFile(output_filename, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    zf.write(manifest_path, arcname="queue.json")
-                    for saved_file_rel_path in file_paths_in_zip.values():
-                        saved_file_abs_path = os.path.join(tmpdir, saved_file_rel_path)
-                        if os.path.exists(saved_file_abs_path):
-                             zf.write(saved_file_abs_path, arcname=saved_file_rel_path)
-                        else:
-                             print(f"Warning (Autosave): File {saved_file_rel_path} not found during zipping.")
-                return output_filename
-             return None
-
-        saved_path = _save_queue_to_file(global_queue_ref, AUTOSAVE_FILENAME)
-
-        if saved_path:
-            print(f"Queue autosaved successfully to {saved_path}")
-        else:
-            print("Autosave failed.")
-    except Exception as e:
-        print(f"Error during autosave: {e}")
-        traceback.print_exc()
-
-def finalize_generation_with_state(current_state):
-     if not isinstance(current_state, dict) or 'gen' not in current_state:
-         return gr.update(), gr.update(interactive=True), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), gr.update(), current_state
-
-     gallery_update, abort_btn_update, gen_btn_update, add_queue_btn_update, current_gen_col_update, gen_info_update = finalize_generation(current_state)
-     accordion_update = gr.Accordion(open=False) if len(get_gen_info(current_state).get("queue", [])) <= 1 else gr.update()
-     return gallery_update, abort_btn_update, gen_btn_update, add_queue_btn_update, current_gen_col_update, gen_info_update, accordion_update, current_state
-
-def get_queue_table(queue):
-    data = []
-    if len(queue) == 1:
-        return data 
-
-    for i, item in enumerate(queue):
-        if i==0:
-            continue
-        truncated_prompt = (item['prompt'][:97] + '...') if len(item['prompt']) > 100 else item['prompt']
-        full_prompt = item['prompt'].replace('"', '&quot;')
-        prompt_cell = f'<span title="{full_prompt}">{truncated_prompt}</span>'
-        start_img_uri =item.get('start_image_data_base64')
-        start_img_uri = start_img_uri[0] if start_img_uri !=None else None
-        start_img_labels =item.get('start_image_labels')
-        end_img_uri = item.get('end_image_data_base64')
-        end_img_uri = end_img_uri[0] if end_img_uri !=None else None
-        end_img_labels =item.get('end_image_labels')
-        thumbnail_size = "50px"
-        num_steps = item.get('steps')
-        length = item.get('length')
-        start_img_md = ""
-        end_img_md = ""
-        if start_img_uri:
-            start_img_md = f'<div class="hover-image"><img src="{start_img_uri}" alt="{start_img_labels[0]}" style="max-width:{thumbnail_size}; max-height:{thumbnail_size}; display: block; margin: auto; object-fit: contain;" /><span class="tooltip2">{start_img_labels[0]}</span></div>'
-        if end_img_uri:
-            end_img_md = f'<div class="hover-image"><img src="{end_img_uri}" alt="{end_img_labels[0]}" style="max-width:{thumbnail_size}; max-height:{thumbnail_size}; display: block; margin: auto; object-fit: contain;" /><span class="tooltip2">{end_img_labels[0]}</span></div>'
-
-
-        data.append([item.get('repeats', "1"),
-                    prompt_cell,
-                    length,
-                    num_steps,
-                    start_img_md,
-                    end_img_md,
-                    "↑",
-                    "↓",
-                    "✖"
-                    ])    
-    return data
-def update_queue_data(queue):
-    update_global_queue_ref(queue)
-    data = get_queue_table(queue)
-
-    if len(data) == 0:
-        return gr.DataFrame(visible=False)
-    else:
-        return gr.DataFrame(value=data, visible= True)
 
 def create_html_progress_bar(percentage=0.0, text="Idle", is_idle=True):
     bar_class = "progress-bar-custom idle" if is_idle else "progress-bar-custom"
@@ -3254,69 +2195,17 @@ def refresh_gallery(state): #, msg
     if gen.get("last_selected", True) and file_list is not None:
         choice = max(len(file_list) - 1,0)  
 
-    queue = gen.get("queue", [])
     abort_interactive = not gen.get("abort", False)
-    if not in_progress or len(queue) == 0:
-        return gr.Gallery(selected_index=choice, value = file_list), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Row(visible=False), gr.Row(visible=False), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(visible= False)
-    else:
-        task = queue[0]
-        prompt =  task["prompt"]
-        params = task["params"]
-        model_type = params["model_type"] 
-        base_model_type = get_base_model_type(model_type)
-        model_def = get_model_def(model_type) 
-        onemorewindow_visible = test_any_sliding_window(base_model_type) and params.get("image_mode",0) == 0 and not params.get("mode","").startswith("edit_")
-        enhanced = False
-        if prompt.startswith("!enhanced!\n"):
-            enhanced = True
-            prompt = prompt[len("!enhanced!\n"):]
-        if "\n" in prompt :
-            prompts = prompt.split("\n")
-            window_no= gen.get("window_no",1)
-            if window_no > len(prompts):
-                window_no = len(prompts)
-            window_no -= 1
-            prompts[window_no]="<B>" + prompts[window_no] + "</B>"
-            prompt = "<BR><DIV style='height:8px'></DIV>".join(prompts)
-        if enhanced:
-            prompt = "<U><B>Enhanced:</B></U><BR>" + prompt
-
-        if len(header_text) > 0:
-            prompt =  "<I>" + header_text + "</I><BR><BR>" + prompt
-        list_uri = []
-        list_labels = []
-        start_img_uri = task.get('start_image_data_base64')
-        if start_img_uri != None:
-            list_uri += start_img_uri
-            list_labels += task.get('start_image_labels')
-        end_img_uri = task.get('end_image_data_base64')
-        if end_img_uri != None:
-            list_uri += end_img_uri
-            list_labels += task.get('end_image_labels')
-
-        thumbnail_size = "100px"
-        thumbnails = ""
-        for i, (img_label, img_uri) in enumerate(zip(list_labels,list_uri)):
-            thumbnails += f'<TD onclick=sendColIndex({i})><div class="hover-image" ><img src="{img_uri}" alt="{img_label}" style="max-width:{thumbnail_size}; max-height:{thumbnail_size}; display: block; margin: auto; object-fit: contain;" /><span class="tooltip">{img_label}</span></div></TD>'  
-        
-        # Get current theme from server config  
-        current_theme = server_config.get("UI_theme", "default")
-        
-        # Use minimal, adaptive styling that blends with any background
-        # This creates a subtle container that doesn't interfere with the page's theme
-        table_style = """
-            border: 1px solid rgba(128, 128, 128, 0.3); 
-            background-color: transparent; 
-            color: inherit; 
-            padding: 8px;
-            border-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        """
-        if params.get("mode", None) in ['edit'] : onemorewindow_visible = False
-        gen_buttons_visible = True
-        html =  f"<TABLE WIDTH=100% ID=PINFO style='{table_style}'><TR style='height:140px'><TD width=100% style='{table_style}'>" + prompt + "</TD>" + thumbnails + "</TR></TABLE>" 
-        html_output = gr.HTML(html, visible= True)
-        return gr.Gallery(selected_index=choice, value = file_list), html_output, gr.Button(visible=False), gr.Button(visible=True), gr.Row(visible=True), gr.Row(visible= gen_buttons_visible), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(visible= onemorewindow_visible)
+    
+    # Simplified without queue handling
+    return (gr.Gallery(selected_index=choice, value=file_list), 
+            gr.HTML("", visible=False),  
+            gr.Button(visible=True), 
+            gr.Button(visible=False), 
+            gr.Row(visible=False), 
+            gr.Row(visible=False), 
+            gr.Button(interactive=abort_interactive), 
+            gr.Button(visible=False))
 
 
 
@@ -5395,148 +4284,6 @@ def generate_preview(model_type, latents):
     return images
 
 
-def process_tasks(state):
-    from shared.utils.thread_utils import AsyncStream, async_run
-
-    gen = get_gen_info(state)
-    queue = gen.get("queue", [])
-    progress = None
-
-    if len(queue) == 0:
-        gen["status_display"] =  False
-        return
-    with lock:
-        gen = get_gen_info(state)
-        clear_file_list = server_config.get("clear_file_list", 0)    
-        file_list = gen.get("file_list", [])
-        file_settings_list = gen.get("file_settings_list", [])
-        if clear_file_list > 0:
-            file_list_current_size = len(file_list)
-            keep_file_from = max(file_list_current_size - clear_file_list, 0)
-            files_removed = keep_file_from
-            choice = gen.get("selected",0)
-            choice = max(choice- files_removed, 0)
-            file_list = file_list[ keep_file_from: ]
-            file_settings_list = file_settings_list[ keep_file_from: ]
-        else:
-            file_list = []
-            choice = 0
-        gen["selected"] = choice         
-        gen["file_list"] = file_list    
-        gen["file_settings_list"] = file_settings_list    
-
-    while True:
-        with gen_lock:
-            process_status = gen.get("process_status", None)
-            if process_status is None:
-                gen["process_status"] = "process:main"
-                break
-        time.sleep(1)
-
-    def release_gen():
-        with gen_lock:
-            process_status = gen.get("process_status", None)
-            if process_status.startswith("request:"):        
-                gen["process_status"] = "process:" + process_status[len("request:"):]
-            else:
-                gen["process_status"] = None
-
-    start_time = time.time()
-
-    global gen_in_progress
-    gen_in_progress = True
-    gen["in_progress"] = True
-    gen["preview"] = None
-    gen["status"] = "Generating Video"
-    gen["header_text"] = ""    
-
-    yield time.time(), time.time() 
-    prompt_no = 0
-    while len(queue) > 0:
-        prompt_no += 1
-        gen["prompt_no"] = prompt_no
-        task = queue[0]
-        task_id = task["id"] 
-        params = task['params']
-
-        com_stream = AsyncStream()
-        send_cmd = com_stream.output_queue.push
-        def generate_video_error_handler():
-            try:
-                generate_video(task, send_cmd,  **params)
-            except Exception as e:
-                tb = traceback.format_exc().split('\n')[:-1] 
-                print('\n'.join(tb))
-                send_cmd("error",str(e))
-            finally:
-                send_cmd("exit", None)
-
-
-        async_run(generate_video_error_handler)
-
-        while True:
-            cmd, data = com_stream.output_queue.next()               
-            if cmd == "exit":
-                break
-            elif cmd == "info":
-                gr.Info(data)
-            elif cmd == "error": 
-                queue.clear()
-                gen["prompts_max"] = 0
-                gen["prompt"] = ""
-                gen["status_display"] =  False
-                release_gen()
-                raise gr.Error(data, print_exception= False, duration = 0)
-            elif cmd == "status":
-                gen["status"] = data
-            elif cmd == "output":
-                gen["preview"] = None
-                yield time.time() , time.time() 
-            elif cmd == "progress":
-                gen["progress_args"] = data
-                # progress(*data)
-            elif cmd == "preview":
-                torch.cuda.current_stream().synchronize()
-                preview= None if data== None else generate_preview(params["model_type"], data) 
-                gen["preview"] = preview
-                yield time.time() , gr.Text()
-            else:
-                release_gen()
-                raise Exception(f"unknown command {cmd}")
-
-        abort = gen.get("abort", False)
-        if abort:
-            gen["abort"] = False
-            status = "Video Generation Aborted", "Video Generation Aborted"
-            # yield  gr.Text(), gr.Text()
-            yield time.time() , time.time() 
-            gen["status"] = status
-
-        queue[:] = [item for item in queue if item['id'] != task['id']]
-        update_global_queue_ref(queue)
-
-    gen["prompts_max"] = 0
-    gen["prompt"] = ""
-    end_time = time.time()
-    if abort:
-        # status = f"Video generation was aborted. Total Generation Time: {end_time-start_time:.1f}s" 
-        status = f"Video generation was aborted. Total Generation Time: {format_time(end_time-start_time)}" 
-    else:
-        # status = f"Total Generation Time: {end_time-start_time:.1f}s" 
-        status = f"Total Generation Time: {format_time(end_time-start_time)}"         
-        # Play notification sound when video generation completed successfully
-        try:
-            if server_config.get("notification_sound_enabled", 1):
-                volume = server_config.get("notification_sound_volume", 50)
-                notification_sound.notify_video_completion(volume=volume)
-        except Exception as e:
-            print(f"Error playing notification sound: {e}")
-    gen["status"] = status
-    gen["status_display"] =  False
-    release_gen()
-
-
-
 def get_generation_status(prompt_no, prompts_max, repeat_no, repeat_max, window_no, total_windows):
     if prompts_max == 1:        
         if repeat_max <= 1:
@@ -6586,52 +5333,6 @@ def download_loras():
     return
 
 
-def handle_celll_selection(state, evt: gr.SelectData):
-    gen = get_gen_info(state)
-    queue = gen.get("queue", [])
-
-    if evt.index is None:
-        return gr.update(), gr.update(), gr.update(visible=False)
-    row_index, col_index = evt.index
-    cell_value = None
-    if col_index in [6, 7, 8]:
-        if col_index == 6: cell_value = "↑"
-        elif col_index == 7: cell_value = "↓"
-        elif col_index == 8: cell_value = "✖"
-    if col_index == 6:
-        new_df_data = move_up(queue, [row_index])
-        return new_df_data, gr.update(), gr.update(visible=False)
-    elif col_index == 7:
-        new_df_data = move_down(queue, [row_index])
-        return new_df_data, gr.update(), gr.update(visible=False)
-    elif col_index == 8:
-        new_df_data = remove_task(queue, [row_index])
-        gen["prompts_max"] = gen.get("prompts_max",0) - 1
-        update_status(state)
-        return new_df_data, gr.update(), gr.update(visible=False)
-    start_img_col_idx = 4
-    end_img_col_idx = 5
-    image_data_to_show = None
-    if col_index == start_img_col_idx:
-        with lock:
-            row_index += 1
-            if row_index < len(queue):
-                image_data_to_show = queue[row_index].get('start_image_data_base64')
-                names = queue[row_index].get('start_image_labels')
-    elif col_index == end_img_col_idx:
-        with lock:
-            row_index += 1
-            if row_index < len(queue):
-                image_data_to_show = queue[row_index].get('end_image_data_base64')
-                names = queue[row_index].get('end_image_labels')
-
-    if image_data_to_show:
-        value = get_modal_image( image_data_to_show[0], names[0])
-        return gr.update(), gr.update(value=value), gr.update(visible=True)
-    else:
-        return gr.update(), gr.update(), gr.update(visible=False)
-
-
 def change_model(state, model_choice):
     if model_choice == None:
         return
@@ -6786,14 +5487,6 @@ def refresh_preview(state):
     preview = gen.get("preview", None)
     return preview
 
-def init_process_queue_if_any(state):                
-    gen = get_gen_info(state)
-    if bool(gen.get("queue",[])):
-        state["validate_success"] = 1
-        return gr.Button(visible=False), gr.Button(visible=True), gr.Column(visible=True)                   
-    else:
-        return gr.Button(visible=True), gr.Button(visible=False), gr.Column(visible=False)
-
 def get_modal_image(image_base64, label):
     return "<DIV ALIGN=CENTER><IMG SRC=\"" + image_base64 + "\"><div style='position: absolute; top: 0; left: 0; background: rgba(0,0,0,0.7); color: white; padding: 5px; font-size: 12px;'>" + label + "</div></DIV>"
 
@@ -6809,23 +5502,8 @@ def show_preview_column_modal(state, column_no):
     column_no = int(column_no)
     if column_no == -1:
         return gr.update(), gr.update(), gr.update()
-    gen = get_gen_info(state)
-    queue = gen.get("queue", [])
-    task = queue[0]
-    list_uri = []
-    names = []
-    start_img_uri = task.get('start_image_data_base64')
-    if start_img_uri != None:
-        list_uri += start_img_uri
-        names += task.get('start_image_labels')
-    end_img_uri = task.get('end_image_data_base64')
-    if end_img_uri != None:
-        list_uri += end_img_uri
-        names += task.get('end_image_labels')
-
-    value = get_modal_image( list_uri[column_no],names[column_no]  )
-
-    return -1, gr.update(value=value), gr.update(visible=True)
+    # Queue functionality removed - return empty modal
+    return -1, gr.update(), gr.update(visible=False)
 
 def update_video_guide_outpainting(video_guide_outpainting_value, value, pos):
     if len(video_guide_outpainting_value) <= 1:
@@ -9424,7 +8102,6 @@ def create_ui():
         return main
 
 if __name__ == "__main__":
-    atexit.register(autosave_queue)
     download_ffmpeg()
     # threading.Thread(target=runner, daemon=True).start()
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"

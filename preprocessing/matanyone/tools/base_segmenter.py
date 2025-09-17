@@ -1,6 +1,7 @@
 import time
 import torch
 import cv2
+import os
 from PIL import Image, ImageDraw, ImageOps
 import numpy as np
 from typing import Union
@@ -29,10 +30,19 @@ class BaseSegmenter:
         with init_empty_weights():
             self.model = sam_model_registry[model_type](checkpoint=SAM_checkpoint)
         from mmgp import offload
-        # self.model.to(torch.float16)
-        # offload.save_model(self.model, "ckpts/mask/sam_vit_h_4b8939_fp16.safetensors")
         
-        offload.load_model_data(self.model, "ckpts/mask/sam_vit_h_4b8939_fp16.safetensors")
+        # Check if safetensors file exists, if not create it
+        safetensors_path = "ckpts/mask/sam_vit_h_4b8939_fp16.safetensors"
+        if not os.path.exists(safetensors_path):
+            print(f"Creating safetensors file at {safetensors_path}")
+            os.makedirs(os.path.dirname(safetensors_path), exist_ok=True)
+            # Load the model with weights and save as safetensors
+            temp_model = sam_model_registry[model_type](checkpoint=SAM_checkpoint)
+            temp_model.to(torch.float16)
+            offload.save_model(temp_model, safetensors_path)
+            del temp_model
+        
+        offload.load_model_data(self.model, safetensors_path)
         self.model.to(torch.float32) # need to be optimized, if not f32 crappy precision
         self.model.to(device=self.device)
         self.predictor = SamPredictor(self.model)

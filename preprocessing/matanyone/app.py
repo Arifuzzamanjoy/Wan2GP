@@ -679,8 +679,8 @@ def load_unload_models(selected):
 
             from mmgp import offload
 
-            # sam_checkpoint = load_file_from_url(sam_checkpoint_url_dict[arg_sam_model_type], ".")
-            sam_checkpoint = None
+            sam_checkpoint = load_file_from_url(sam_checkpoint_url_dict[arg_sam_model_type], ".")
+            # sam_checkpoint = None
 
             transfer_stream = torch.cuda.Stream()
             with torch.cuda.stream(transfer_stream):

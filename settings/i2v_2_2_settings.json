@@ -1,0 +1,28 @@
+{
+    "settings_version": 2.27,
+    "prompt": "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field.",
+    "resolution": "832x480",
+    "video_length": 81,
+    "num_inference_steps": 30,
+    "seed": -1,
+    "repeat_generation": 1,
+    "multi_images_gen_type": 0,
+    "guidance_scale": 3.5,
+    "flow_shift": 5,
+    "negative_prompt": "",
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "skip_steps_multiplier": 1.5,
+    "skip_steps_start_step_perc": 20,
+    "RIFLEx_setting": 0,
+    "slg_switch": 0,
+    "slg_layers": [
+        9
+    ],
+    "slg_start_perc": 10,
+    "slg_end_perc": 90,
+    "sample_solver": "unipc",
+    "guidance_phases": 2,
+    "switch_threshold": 900,
+    "guidance2_scale": 3.5
+}
