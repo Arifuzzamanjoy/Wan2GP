@@ -2,7 +2,7 @@
 
 -----
 <p align="center">
-<b>WanGP by DeepBeepMeep : The best Open Source Video Generative Models Accessible to the GPU Poor</b>
+<b>WanGP : The best Open Source Video Generative Models Accessible to the GPU Poor</b>
 </p>
 
 WanGP supports the Wan (and derived models), Hunyuan Video and LTV Video models with:
