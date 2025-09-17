@@ -316,5 +316,5 @@ https://www.youtube.com/watch?v=T5jNiEhf9xk
 ---
 
 <p align="center">
-Made with ❤️ by DeepBeepMeep
+WanGP
 </p> 
